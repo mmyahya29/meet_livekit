@@ -1,6 +1,16 @@
-# Meet LiveKit
+<h1 align="center">
+  Meet LiveKit
+</h1>
 
-A robust, drop-in Flutter package for adding LiveKit-powered group video calls to your app. Extracted and decoupled from the Foster marketplace architecture, this package offers a fully functional, self-contained video conferencing UI with local data-channel chat, advanced participant tracking, and custom meeting timeouts.
+<p align="center">
+  A robust, drop-in Flutter package for adding LiveKit-powered group video calls to your app.
+</p>
+
+## Introduction
+
+Extracted and decoupled from the Foster marketplace architecture, this package offers a fully functional, self-contained video conferencing UI with local data-channel chat, advanced participant tracking, and custom meeting timeouts. It handles all states (connecting, error, connected) natively, allowing you to drop a world-class WebRTC video room into your application with just a few lines of code.
+
+Whether you're building a telehealth platform, an internal communication tool, or an e-learning application, `meet_livekit` provides the heavy lifting out of the box.
 
 ## Features
 
