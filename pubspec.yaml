@@ -4,17 +4,17 @@ version: 0.0.1
 homepage:
 
 environment:
-  sdk: ^3.11.4
+  sdk: ">=3.9.2 <4.0.0"
   flutter: ">=1.17.0"
 
 dependencies:
   flutter:
     sdk: flutter
   flutter_animate: ^4.5.2
-  flutter_riverpod: ^2.6.1
+  flutter_riverpod: ^3.3.1
   flutter_webrtc: ^1.6.0
-  livekit_client: ^2.11.0
-  lucide_icons_flutter: ^3.1.15
+  livekit_client: ^2.8.1
+  lucide_icons_flutter: ^3.1.14+1
 
 dev_dependencies:
   flutter_test:
