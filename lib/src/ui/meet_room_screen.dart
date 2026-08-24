@@ -16,6 +16,7 @@ class MeetRoomScreen extends ConsumerStatefulWidget {
   final String serverUrl;
   final String token;
   final int? durationMinutes;
+  final DateTime? scheduledEndTime;
   final void Function(MeetingSummary summary) onLeaveCall;
   final void Function(Object error)? onError;
 
@@ -24,6 +25,7 @@ class MeetRoomScreen extends ConsumerStatefulWidget {
     required this.token,
     required this.onLeaveCall,
     this.durationMinutes,
+    this.scheduledEndTime,
     this.onError,
     super.key,
   });
@@ -46,11 +48,16 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
   final ValueNotifier<bool> _gracePeriodNotifier = ValueNotifier<bool>(false);
   Timer? _callTimer;
 
+  bool get _hasTimer => widget.scheduledEndTime != null || widget.durationMinutes != null;
+
   @override
   void initState() {
     super.initState();
     _meetingStartTime = DateTime.now();
-    if (widget.durationMinutes != null) {
+    if (widget.scheduledEndTime != null) {
+      final diff = widget.scheduledEndTime!.difference(DateTime.now()).inSeconds;
+      _secondsRemainingNotifier.value = diff > 0 ? diff : 0;
+    } else if (widget.durationMinutes != null) {
       _secondsRemainingNotifier.value = widget.durationMinutes! * 60;
     }
     
@@ -85,7 +92,7 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
         room.addListener(_onRoomEvent);
         _setupRoomListener(room);
         
-        if (widget.durationMinutes != null) {
+        if (_hasTimer) {
           _startTimer();
         }
       }
@@ -372,7 +379,7 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
                 ),
               ),
             ),
-            if (callState == MeetCallState.connected && widget.durationMinutes != null)
+            if (callState == MeetCallState.connected && _hasTimer)
               Positioned(
                 top: 16,
                 left: 0,
