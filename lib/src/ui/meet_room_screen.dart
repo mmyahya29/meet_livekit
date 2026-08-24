@@ -109,7 +109,7 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
 
   void _trackParticipantJoin(Participant p) {
     if (_participantsTracker.containsKey(p.identity)) {
-      _participantsTracker[p.identity]!.lastLeftAt = null; // Rejoined
+      _participantsTracker[p.identity]!.markRejoined(DateTime.now()); // Rejoined
     } else {
       _participantsTracker[p.identity] = ParticipantRecord(
         identity: p.identity,

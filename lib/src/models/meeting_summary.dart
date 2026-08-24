@@ -17,28 +17,48 @@ class MeetingSummary {
   }
 }
 
+class ParticipantSession {
+  final DateTime joinedAt;
+  DateTime? leftAt;
+
+  ParticipantSession({required this.joinedAt, this.leftAt});
+
+  Duration get duration => (leftAt ?? DateTime.now()).difference(joinedAt);
+}
+
 class ParticipantRecord {
   final String identity;
   final String name;
-  final DateTime firstJoinedAt;
-  DateTime? lastLeftAt;
-  Duration totalTimeInMeeting;
+  final List<ParticipantSession> sessions = [];
 
   ParticipantRecord({
     required this.identity,
     required this.name,
-    required this.firstJoinedAt,
-    this.lastLeftAt,
-    this.totalTimeInMeeting = Duration.zero,
-  });
+    required DateTime firstJoinedAt,
+  }) {
+    sessions.add(ParticipantSession(joinedAt: firstJoinedAt));
+  }
+
+  DateTime get firstJoinedAt => sessions.first.joinedAt;
+  DateTime? get lastLeftAt => sessions.last.leftAt;
+
+  Duration get totalTimeInMeeting {
+    return sessions.fold(Duration.zero, (total, session) => total + session.duration);
+  }
+
+  void markRejoined(DateTime joinedAt) {
+    if (sessions.isNotEmpty && sessions.last.leftAt == null) return; // Already active
+    sessions.add(ParticipantSession(joinedAt: joinedAt));
+  }
 
   void markLeft(DateTime leftAt) {
-    lastLeftAt = leftAt;
-    totalTimeInMeeting += leftAt.difference(firstJoinedAt);
+    if (sessions.isNotEmpty && sessions.last.leftAt == null) {
+      sessions.last.leftAt = leftAt;
+    }
   }
 
   @override
   String toString() {
-    return 'ParticipantRecord($identity, name: $name, totalTime: $totalTimeInMeeting)';
+    return 'ParticipantRecord($identity, name: $name, totalTime: $totalTimeInMeeting, sessions: ${sessions.length})';
   }
 }
