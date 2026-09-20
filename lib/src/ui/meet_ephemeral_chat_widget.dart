@@ -31,19 +31,35 @@ class _MeetEphemeralChatWidgetState extends State<MeetEphemeralChatWidget> {
   void _setupListener() {
     _listener = widget.room.createListener();
     _listener?.on<DataReceivedEvent>((event) {
-      final text = utf8.decode(event.data);
-      if (mounted) {
-        setState(() {
-          _messages.add({
-            'senderId': event.participant?.identity ?? 'Unknown',
-            'senderName': event.participant?.name.isNotEmpty == true ? event.participant!.name : 'Anonymous',
-            'text': text,
-            'timestamp': DateTime.now(),
+      if (event.topic != 'chat') return;
+      
+      try {
+        final text = utf8.decode(event.data);
+        if (mounted) {
+          setState(() {
+            _messages.add({
+              'senderId': event.participant?.identity ?? 'Unknown',
+              'senderName': event.participant?.name.isNotEmpty == true ? event.participant!.name : 'Anonymous',
+              'text': text,
+              'timestamp': DateTime.now(),
+            });
           });
-        });
-        _scrollToBottom();
+          _scrollToBottom();
+        }
+      } catch (e) {
+        debugPrint('Failed to decode chat message: $e');
       }
     });
+  }
+
+  @override
+  void didUpdateWidget(MeetEphemeralChatWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.room != oldWidget.room) {
+      _listener?.dispose();
+      _setupListener();
+      _myIdentity = widget.room.localParticipant?.identity;
+    }
   }
 
   @override
@@ -71,7 +87,7 @@ class _MeetEphemeralChatWidgetState extends State<MeetEphemeralChatWidget> {
 
     final data = utf8.encode(text);
     try {
-      await widget.room.localParticipant?.publishData(data, reliable: true);
+      await widget.room.localParticipant?.publishData(data, reliable: true, topic: 'chat');
     } catch (e) {
       debugPrint('Failed to send data: $e');
     }

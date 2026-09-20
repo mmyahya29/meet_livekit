@@ -68,14 +68,21 @@ class MeetLiveKitRoomNotifier extends Notifier<Room> {
       );
     }
 
-    await state.connect(
-      serverUrl,
-      token,
-    );
+    try {
+      await state.connect(
+        serverUrl,
+        token,
+      );
 
-    // Enable camera and microphone on join
-    await state.localParticipant?.setCameraEnabled(true);
-    await state.localParticipant?.setMicrophoneEnabled(true);
+      // Enable camera and microphone on join
+      await state.localParticipant?.setCameraEnabled(true);
+      await state.localParticipant?.setMicrophoneEnabled(true);
+    } catch (e) {
+      try {
+        await state.disconnect();
+      } catch (_) {}
+      rethrow;
+    }
   }
 
   /// Disconnects cleanly, releasing all media resources
@@ -96,7 +103,7 @@ class MeetLiveKitRoomNotifier extends Notifier<Room> {
 }
 
 // ─── CALL STATE — simple enum for UI to react to ──────────────────────────────
-enum MeetCallState { idle, connecting, connected, disconnected, error }
+enum MeetCallState { idle, connecting, connected, disconnected, error, permissionsDenied }
 
 final meetCallStateProvider = NotifierProvider<MeetCallStateNotifier, MeetCallState>(MeetCallStateNotifier.new);
 
@@ -153,3 +160,4 @@ class MeetChatOpenNotifier extends Notifier<bool> {
   @override
   set state(bool value) => super.state = value;
 }
+

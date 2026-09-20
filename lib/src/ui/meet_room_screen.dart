@@ -67,7 +67,8 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
     });
   }
 
-  Future<void> _initCall() async {
+  Future<void> _initCall({int retries = 3}) async {
+    if (!mounted) return;
     ref.read(meetCallStateProvider.notifier).state = MeetCallState.connecting;
     try {
       await _roomNotifier.connect(
@@ -97,7 +98,21 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
         }
       }
     } catch (e) {
-      if (mounted) {
+      if (!mounted) return;
+      final errorStr = e.toString().toLowerCase();
+      final isPermission = errorStr.contains('notallowederror') || 
+                           errorStr.contains('permission') || 
+                           errorStr.contains('denied');
+                           
+      if (isPermission) {
+        ref.read(meetCallStateProvider.notifier).state = MeetCallState.permissionsDenied;
+      } else if (retries > 0) {
+        // Fallback: Retry connection
+        await Future.delayed(const Duration(seconds: 2));
+        if (mounted) {
+          _initCall(retries: retries - 1);
+        }
+      } else {
         ref.read(meetCallStateProvider.notifier).state = MeetCallState.error;
         widget.onError?.call(e);
       }
@@ -272,9 +287,16 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
       setState(() {});
       
       final room = ref.read(meetLiveKitRoomProvider);
-      if (room.connectionState == ConnectionState.disconnected && !_isManuallyEnding) {
-        ref.read(meetCallStateProvider.notifier).state = MeetCallState.disconnected;
-        _forceEndCall();
+      final callStateNotifier = ref.read(meetCallStateProvider.notifier);
+      
+      if (room.connectionState == ConnectionState.reconnecting) {
+        callStateNotifier.state = MeetCallState.connecting;
+      } else if (room.connectionState == ConnectionState.connected) {
+        callStateNotifier.state = MeetCallState.connected;
+      } else if (room.connectionState == ConnectionState.disconnected && !_isManuallyEnding) {
+        // Automatically attempt to reconnect instead of dropping the call!
+        callStateNotifier.state = MeetCallState.connecting;
+        _initCall(); // Safely recreates room and reconnects
       }
     }
   }
@@ -317,7 +339,10 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
 
     Widget body = switch (callState) {
       MeetCallState.connecting => const _ConnectingView(),
-      MeetCallState.error => _ErrorView(onRetry: _initCall, onBack: () => widget.onLeaveCall(
+      MeetCallState.permissionsDenied => _PermissionsDeniedView(onRetry: () => _initCall(), onBack: () => widget.onLeaveCall(
+        MeetingSummary(startTime: _meetingStartTime, endTime: DateTime.now(), participants: {})
+      )),
+      MeetCallState.error => _ErrorView(onRetry: () => _initCall(), onBack: () => widget.onLeaveCall(
         MeetingSummary(startTime: _meetingStartTime, endTime: DateTime.now(), participants: {})
       )),
       MeetCallState.connected || _ => _CallView(
@@ -517,6 +542,49 @@ class _ConnectingView extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 // ERROR VIEW
 // ─────────────────────────────────────────────────────────────────────────────
+class _PermissionsDeniedView extends StatelessWidget {
+  final VoidCallback onRetry;
+  final VoidCallback onBack;
+  const _PermissionsDeniedView({required this.onRetry, required this.onBack});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(LucideIcons.micOff, color: Colors.orange, size: 64),
+          const SizedBox(height: 16),
+          const Text('Permissions Required', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 32.0),
+            child: Text('We need access to your camera and microphone to connect you to the room.', 
+              style: TextStyle(color: Colors.white70, fontSize: 14), textAlign: TextAlign.center),
+          ),
+          const SizedBox(height: 24),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              TextButton(onPressed: onBack,  child: const Text('Go Back')),
+              const SizedBox(width: 16),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: MeetColors.primary, 
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                ),
+                onPressed: onRetry, 
+                child: const Text('Relaunch Permissions', style: TextStyle(fontWeight: FontWeight.bold))
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ErrorView extends StatelessWidget {
   final VoidCallback onRetry;
   final VoidCallback onBack;
