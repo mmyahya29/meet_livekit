@@ -130,7 +130,7 @@ class MeetLiveKitRoomNotifier extends Notifier<Room> {
         ),
       );
     }
-  }}
+  }
 }
 
 // ─── CALL STATE — simple enum for UI to react to ──────────────────────────────
