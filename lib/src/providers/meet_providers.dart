@@ -94,12 +94,43 @@ class MeetLiveKitRoomNotifier extends Notifier<Room> {
         await state.localParticipant?.setCameraEnabled(false);
         await state.localParticipant?.setScreenShareEnabled(false);
       }
-      await state.disconnect();
+      // Put a timeout so we don't hang forever
+      await state.disconnect().timeout(const Duration(seconds: 2));
     } catch (e) {
       // ignore: avoid_print
       print('Error disconnecting: $e');
+    } finally {
+      // Destroy the room engine to prevent any ghost audio from sticking around
+      try {
+        await state.dispose();
+      } catch (_) {}
+      
+      // We must assign a new room so the provider remains in a valid state
+      state = Room(
+        roomOptions: const RoomOptions(
+          adaptiveStream: true,
+          dynacast: true,
+          defaultCameraCaptureOptions: CameraCaptureOptions(
+            params: VideoParametersPresets.h720_169,
+            maxFrameRate: 30,
+          ),
+          defaultAudioCaptureOptions: AudioCaptureOptions(
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          ),
+          defaultVideoPublishOptions: VideoPublishOptions(
+            simulcast: true,
+            videoCodec: 'vp8',
+          ),
+          defaultAudioPublishOptions: AudioPublishOptions(
+            dtx: true,
+            red: true,
+          ),
+        ),
+      );
     }
-  }
+  }}
 }
 
 // ─── CALL STATE — simple enum for UI to react to ──────────────────────────────

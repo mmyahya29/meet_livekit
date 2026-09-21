@@ -195,7 +195,7 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
     );
 
     if (confirm != true) return;
-    _forceEndCall();
+    await _forceEndCall();
   }
 
   Future<void> _forceEndCall() async {
@@ -339,12 +339,8 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
 
     Widget body = switch (callState) {
       MeetCallState.connecting => const _ConnectingView(),
-      MeetCallState.permissionsDenied => _PermissionsDeniedView(onRetry: () => _initCall(), onBack: () => widget.onLeaveCall(
-        MeetingSummary(startTime: _meetingStartTime, endTime: DateTime.now(), participants: {})
-      )),
-      MeetCallState.error => _ErrorView(onRetry: () => _initCall(), onBack: () => widget.onLeaveCall(
-        MeetingSummary(startTime: _meetingStartTime, endTime: DateTime.now(), participants: {})
-      )),
+      MeetCallState.permissionsDenied => _PermissionsDeniedView(onRetry: () => _initCall(), onBack: () => _forceEndCall()),
+      MeetCallState.error => _ErrorView(onRetry: () => _initCall(), onBack: () => _forceEndCall()),
       MeetCallState.connected || _ => _CallView(
         room:        room,
         isCameraOn:  isCameraOn,
