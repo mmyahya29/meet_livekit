@@ -42,6 +42,10 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
   late final DateTime _meetingStartTime;
   final Map<String, ParticipantRecord> _participantsTracker = {};
   EventsListener<RoomEvent>? _roomListener;
+  // The Room instance `_onRoomEvent` is currently attached to. The room notifier
+  // allocates a brand new Room on every reconnect, so without remembering which
+  // one we subscribed to we would leak a listener (and the engine) per attempt.
+  Room? _listenedRoom;
 
   // Timeout logic
   final ValueNotifier<int> _secondsRemainingNotifier = ValueNotifier<int>(0);
@@ -90,12 +94,15 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
           _trackParticipantJoin(p);
         }
 
-        room.addListener(_onRoomEvent);
+        _attachRoomListener(room);
         _setupRoomListener(room);
         
         if (_hasTimer) {
           _startTimer();
         }
+
+        // A host may have requested an end while we were still connecting.
+        _consumeEndRequest();
       }
     } catch (e) {
       if (!mounted) return;
@@ -119,6 +126,18 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
     }
   }
 
+  void _attachRoomListener(Room room) {
+    if (identical(_listenedRoom, room)) return;
+    _listenedRoom?.removeListener(_onRoomEvent);
+    _listenedRoom = room;
+    room.addListener(_onRoomEvent);
+  }
+
+  void _detachRoomListener() {
+    _listenedRoom?.removeListener(_onRoomEvent);
+    _listenedRoom = null;
+  }
+
   void _setupRoomListener(Room room) {
     _roomListener = room.createListener();
     _roomListener?.on<ParticipantConnectedEvent>((event) {
@@ -127,6 +146,21 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
     _roomListener?.on<ParticipantDisconnectedEvent>((event) {
       _trackParticipantLeave(event.participant.identity);
     });
+  }
+
+  /// Consumes a host-requested end-of-call, if one is pending.
+  ///
+  /// Deliberately funnels through the same graceful path as the in-package timer
+  /// and the manual Leave button, because that path is what:
+  ///   * sets `_isManuallyEnding` BEFORE the room disconnects, which is the only
+  ///     thing that stops `_onRoomEvent` from auto-reconnecting, and
+  ///   * still delivers a `MeetingSummary` to `onLeaveCall`, which hosts rely on
+  ///     to persist collaborative time and to run post-call logic.
+  void _consumeEndRequest() {
+    if (_isManuallyEnding) return;
+    if (!ref.read(meetEndCallRequestedProvider)) return;
+    ref.read(meetEndCallRequestedProvider.notifier).clear();
+    _forceEndCall();
   }
 
   void _trackParticipantJoin(Participant p) {
@@ -294,6 +328,11 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
       } else if (room.connectionState == ConnectionState.connected) {
         callStateNotifier.state = MeetCallState.connected;
       } else if (room.connectionState == ConnectionState.disconnected && !_isManuallyEnding) {
+        // A host-requested end means the disconnect is intentional, so never
+        // resurrect the call. This check is what stops an externally-driven
+        // disconnect (e.g. a host-side timer expiring) from re-joining the room.
+        if (ref.read(meetEndCallRequestedProvider)) return;
+
         // Automatically attempt to reconnect instead of dropping the call!
         callStateNotifier.state = MeetCallState.connecting;
         _initCall(); // Safely recreates room and reconnects
@@ -308,9 +347,11 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
     _secondsRemainingNotifier.dispose();
     _gracePeriodNotifier.dispose();
     _roomListener?.dispose();
-    final room = ref.read(meetLiveKitRoomProvider);
-    room.removeListener(_onRoomEvent);
+    _detachRoomListener();
     _roomNotifier.disconnect();
+    // Never leave an end-request latched. The provider is global, so a stale
+    // `true` would immediately terminate the next call that mounts.
+    ref.read(meetEndCallRequestedProvider.notifier).clear();
     super.dispose();
   }
 
@@ -323,6 +364,18 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
 
   @override
   Widget build(BuildContext context) {
+    // A host can request an end at any moment — including while we are happily
+    // connected, which is precisely when no room event would fire and the
+    // request would otherwise be ignored until the next reconnect. Listening
+    // here is what makes an intentional end actually take effect.
+    ref.listen<bool>(meetEndCallRequestedProvider, (previous, next) {
+      if (!next) return;
+      // `_forceEndCall` calls setState, so never run it during a build.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _consumeEndRequest();
+      });
+    });
+
     if (_isManuallyEnding) {
       return const Scaffold(backgroundColor: Colors.black);
     }

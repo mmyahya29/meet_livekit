@@ -133,6 +133,34 @@ class MeetLiveKitRoomNotifier extends Notifier<Room> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// END-CALL LATCH
+// ---------------------------------------------------------------------------
+// Set by the host app to end a call *intentionally* — for example when the host
+// runs its own countdown outside this package and that countdown expires.
+//
+// This exists because MeetRoomScreen treats any unexpected `disconnected` room
+// event as a network drop and auto-reconnects (see `_onRoomEvent`). Disconnecting
+// the [Room] directly bypasses the private `_isManuallyEnding` guard, so the room
+// silently comes back and the call restarts. Latching the intent here lets the
+// host end the call through this package's own graceful path — which still emits
+// a MeetingSummary to `onLeaveCall` — while keeping reconnect-on-network-drop
+// working for genuine connectivity loss.
+//
+// The flag is one-shot: MeetRoomScreen clears it as soon as it consumes it, and
+// also clears it in `dispose()`, so a stale `true` can never end the next call.
+class MeetEndCallRequester extends Notifier<bool> {
+  @override
+  bool build() => false;
+
+  void request() => state = true;
+
+  void clear() => state = false;
+}
+
+final meetEndCallRequestedProvider =
+    NotifierProvider<MeetEndCallRequester, bool>(MeetEndCallRequester.new);
+
 // ─── CALL STATE — simple enum for UI to react to ──────────────────────────────
 enum MeetCallState { idle, connecting, connected, disconnected, error, permissionsDenied }
 
