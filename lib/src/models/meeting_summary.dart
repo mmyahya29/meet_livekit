@@ -43,11 +43,16 @@ class ParticipantRecord {
   DateTime? get lastLeftAt => sessions.last.leftAt;
 
   Duration get totalTimeInMeeting {
-    return sessions.fold(Duration.zero, (total, session) => total + session.duration);
+    return sessions.fold(
+      Duration.zero,
+      (total, session) => total + session.duration,
+    );
   }
 
   void markRejoined(DateTime joinedAt) {
-    if (sessions.isNotEmpty && sessions.last.leftAt == null) return; // Already active
+    if (sessions.isNotEmpty && sessions.last.leftAt == null) {
+      return; // Already active
+    }
     sessions.add(ParticipantSession(joinedAt: joinedAt));
   }
 

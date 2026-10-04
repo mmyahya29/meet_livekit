@@ -1,30 +1,39 @@
-// This is a basic Flutter widget test.
+// Smoke tests for the example app.
 //
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// This previously asserted against a `Counter` template that no longer exists,
+// so `flutter test` in example/ failed on a freshly cloned checkout.
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:example/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('entry screen renders the join form', (tester) async {
+    await tester.pumpWidget(const ProviderScope(child: MyApp()));
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    expect(find.text('Join LiveKit Room'), findsOneWidget);
+    expect(find.text('Join Room'), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'Server URL'), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'LiveKit Token'), findsOneWidget);
+  });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
+  testWidgets('joining without a URL or token is rejected', (tester) async {
+    await tester.pumpWidget(const ProviderScope(child: MyApp()));
+
+    // The fields ship pre-filled with placeholders, so clear them first to
+    // exercise the guard. Without clearing, Join would attempt a real
+    // connection against a fake credential.
+    await tester.enterText(find.widgetWithText(TextField, 'Server URL'), '');
+    await tester.enterText(find.widgetWithText(TextField, 'LiveKit Token'), '');
+
+    await tester.tap(find.text('Join Room'));
     await tester.pump();
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    // The guard should keep us on the entry screen instead of navigating into
+    // a call with empty credentials.
+    expect(find.text('Please enter a URL and Token'), findsOneWidget);
+    expect(find.text('Join LiveKit Room'), findsOneWidget);
   });
 }

@@ -31,8 +31,7 @@ dependencies:
     sdk: flutter
   meet_livekit:
     path: ../meet_livekit # Replace with actual path or git url
-  flutter_riverpod: ^2.6.1
-  livekit_client: ^2.11.0
+  flutter_riverpod: ^3.3.1
 ```
 
 ## Quick Start
@@ -67,26 +66,98 @@ void joinMeeting(BuildContext context) {
       builder: (context) => MeetRoomScreen(
         serverUrl: 'wss://your-project.livekit.cloud',
         token: 'YOUR_LIVEKIT_ACCESS_TOKEN',
-        
+
         // Optional: Force the meeting to end after 30 minutes
-        durationMinutes: 30, 
-        
+        durationMinutes: 30,
+
         onLeaveCall: (MeetingSummary summary) {
           Navigator.pop(context); // Close the screen
-          
+
           // Access meeting analytics
           print('Meeting lasted: ${summary.totalDuration.inMinutes} minutes');
           for (var p in summary.participants.values) {
             print('${p.name} was present for ${p.totalTimeInMeeting.inMinutes} mins');
           }
         },
-        onError: (error) {
+        onError: (Object error) {
+          // `error` is always a `MeetFailure`. See "Handling failures" below.
           print('Failed to connect: $error');
         },
       ),
     ),
   );
 }
+```
+
+## Handling failures
+
+Every failure surfaced to `onError`, and every terminal one shown in the error
+view, is a `MeetFailure` rather than an opaque SDK exception. Use `kind` to
+decide whether retrying could possibly help:
+
+| `MeetFailureKind` | Meaning | Retryable |
+| --- | --- | --- |
+| `auth` | Token rejected or expired (401/403) | Only with a refreshable token source |
+| `ice` | No usable ICE candidate pair — TURN/NAT/firewall | No |
+| `media` | Camera or microphone unavailable | No |
+| `network` | Socket or DNS failure | Yes |
+| `server` | Server-side error | Yes |
+| `timeout` | Connect or ICE timed out | Yes |
+| `cancelled` | Superseded by a newer attempt | No |
+
+An `ice` failure is deliberately not retried: retrying on the same broken
+network just burns battery and delays the error the user needs to see.
+
+### Retries
+
+`connect` is single-flight and retrying happens in one place, so the initial
+connect, a room `disconnected` event and a tap on Retry cannot start competing
+attempts. Override the policy if the defaults (3 attempts, 2s exponential
+backoff with jitter) do not suit your app:
+
+```dart
+MeetRoomScreen(
+  serverUrl: 'wss://your-project.livekit.cloud',
+  token: '...',
+  retryPolicy: const MeetRetryPolicy(
+    maxAttempts: 2,
+    initialBackoff: Duration(seconds: 3),
+    maxBackoff: Duration(seconds: 15),
+  ),
+)
+```
+
+### Tokens that expire mid-call
+
+Supplying a static `token` means an auth failure cannot be recovered, because
+retrying with the same expired credential cannot succeed. Pass a
+`MeetCallbackTokenSource` to fetch a fresh token instead — it is called on the
+initial connect and again whenever an auth failure triggers a retry:
+
+```dart
+MeetRoomScreen(
+  serverUrl: 'wss://your-project.livekit.cloud',
+  tokenSource: MeetCallbackTokenSource((refresh) async {
+    final res = await fetchTokenFromYourBackend(refresh: refresh);
+    return res.token;
+  }),
+)
+```
+
+### Media
+
+Camera and microphone start after the room connects, independently of each
+other. A denied camera permission no longer takes down the call, and one
+failing does not suppress the other. Turn either off on join with
+`startWithCamera` / `startWithMicrophone`:
+
+```dart
+MeetRoomScreen(
+  serverUrl: 'wss://your-project.livekit.cloud',
+  token: '...',
+  startWithCamera: false,
+  startWithMicrophone: true,
+)
 ```
 
 ## Analytics Tracking (`MeetingSummary`)

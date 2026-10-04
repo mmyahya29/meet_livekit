@@ -9,21 +9,61 @@ import 'package:flutter_animate/flutter_animate.dart';
 
 import '../providers/meet_providers.dart';
 import '../design/meet_design_system.dart';
+import '../models/meet_failure.dart';
+import '../models/meet_retry_policy.dart';
+import '../models/meet_token_source.dart';
 import '../models/meeting_summary.dart';
 import 'meet_ephemeral_chat_widget.dart';
 
 class MeetRoomScreen extends ConsumerStatefulWidget {
   final String serverUrl;
+
+  /// Initial access token.
+  ///
+  /// Kept for backwards compatibility, but prefer [tokenSource] for any call
+  /// that can outlive the token's lifetime — a static token is re-presented on
+  /// every reconnect and cannot be refreshed once it expires.
   final String token;
+
+  /// Supplies tokens, and can mint a fresh one when the current one is
+  /// rejected. Takes precedence over [token] when supplied.
+  final MeetTokenSource? tokenSource;
+
+  /// Whether the camera is started on join.
+  ///
+  /// Defaults to true to preserve previous behaviour. Set false to join
+  /// audio-only, or to let a host app run its own pre-join consent step.
+  final bool startWithCamera;
+
+  /// Whether the microphone is started on join. Defaults to true.
+  final bool startWithMicrophone;
+
+  /// Overrides the default retry behaviour.
+  final MeetRetryPolicy? retryPolicy;
+
+  /// Overrides the hardened default connect options.
+  final ConnectOptions? connectOptions;
+
+  /// Overrides the hardened default room options.
+  final RoomOptions? roomOptions;
+
   final int? durationMinutes;
   final DateTime? scheduledEndTime;
   final void Function(MeetingSummary summary) onLeaveCall;
+
+  /// Called with a classified [MeetFailure] when a call cannot be established.
   final void Function(Object error)? onError;
 
   const MeetRoomScreen({
     required this.serverUrl,
-    required this.token,
     required this.onLeaveCall,
+    this.token = '',
+    this.tokenSource,
+    this.startWithCamera = true,
+    this.startWithMicrophone = true,
+    this.retryPolicy,
+    this.connectOptions,
+    this.roomOptions,
     this.durationMinutes,
     this.scheduledEndTime,
     this.onError,
@@ -34,10 +74,17 @@ class MeetRoomScreen extends ConsumerStatefulWidget {
   ConsumerState<MeetRoomScreen> createState() => _MeetRoomScreenState();
 }
 
-class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBindingObserver {
+class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen>
+    with WidgetsBindingObserver {
   bool _isManuallyEnding = false;
   late final _roomNotifier = ref.read(meetLiveKitRoomProvider.notifier);
-  
+
+  late final MeetTokenSource _tokenSource =
+      widget.tokenSource ?? MeetStaticTokenSource(widget.token);
+
+  /// Held rather than read through `ref` during teardown.
+  late final MeetEndCallRequester _endCallRequester;
+
   // Analytics Tracking
   late final DateTime _meetingStartTime;
   final Map<String, ParticipantRecord> _participantsTracker = {};
@@ -52,78 +99,147 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
   final ValueNotifier<bool> _gracePeriodNotifier = ValueNotifier<bool>(false);
   Timer? _callTimer;
 
-  bool get _hasTimer => widget.scheduledEndTime != null || widget.durationMinutes != null;
+  bool get _hasTimer =>
+      widget.scheduledEndTime != null || widget.durationMinutes != null;
 
   @override
   void initState() {
     super.initState();
     _meetingStartTime = DateTime.now();
+
+    // Captured up front. Reading `ref` from `dispose()` is illegal in
+    // Riverpod 3 — it throws "Cannot use Ref or modify other providers inside
+    // life-cycles" once the element is unmounted.
+    _endCallRequester = ref.read(meetEndCallRequestedProvider.notifier);
+
     if (widget.scheduledEndTime != null) {
-      final diff = widget.scheduledEndTime!.difference(DateTime.now()).inSeconds;
+      final diff = widget.scheduledEndTime!
+          .difference(DateTime.now())
+          .inSeconds;
       _secondsRemainingNotifier.value = diff > 0 ? diff : 0;
     } else if (widget.durationMinutes != null) {
       _secondsRemainingNotifier.value = widget.durationMinutes! * 60;
     }
-    
+
     WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _initCall();
     });
   }
 
-  Future<void> _initCall({int retries = 3}) async {
+  /// Establishes the call.
+  ///
+  /// There is deliberately no retry counter here. Retrying lived in four
+  /// separate call sites, each with its own `retries: 3` default, so one
+  /// network blip could fan out into roughly a dozen concurrent attempts that
+  /// each rebuilt the Room and starved one another. Retry now lives in a single
+  /// place inside [MeetLiveKitRoomNotifier], which also coalesces concurrent
+  /// callers onto one in-flight attempt.
+  ///
+  /// [isUserInitiated] is the only thing that can restart a call after it has
+  /// failed terminally.
+  Future<void> _initCall({bool isUserInitiated = false}) async {
     if (!mounted) return;
-    ref.read(meetCallStateProvider.notifier).state = MeetCallState.connecting;
+    if (_isManuallyEnding) return;
+
+    // A terminal failure is terminal. Without this latch a stray room event
+    // would re-enter the connect path and restart the cycle that just failed.
+    if (!isUserInitiated && _roomNotifier.hasGaveUp) return;
+
+    if (isUserInitiated) {
+      _roomNotifier.resetGaveUp();
+    }
+
+    // Always reset, not just on retry. These providers are global singletons,
+    // so a second call would otherwise inherit the previous call's chat-open /
+    // grid-view / camera state. Safe here because `_initCall` runs from a
+    // post-frame callback; Riverpod forbids provider writes during build.
+    resetCallScopedState(ref);
+
+    _roomNotifier.configure(
+      roomOptions: widget.roomOptions,
+      connectOptions: widget.connectOptions,
+      retryPolicy: widget.retryPolicy,
+    );
+
+    final callState = ref.read(meetCallStateProvider.notifier);
+    callState.state = MeetCallState.connecting;
+
     try {
       await _roomNotifier.connect(
         serverUrl: widget.serverUrl,
-        token: widget.token,
+        tokenSource: _tokenSource,
       );
 
-      if (mounted) {
-        ref.read(meetCallStateProvider.notifier).state = MeetCallState.connected;
-        final room = ref.read(meetLiveKitRoomProvider);
-        
-        // Track Local Participant
-        if (room.localParticipant != null) {
-          _trackParticipantJoin(room.localParticipant!);
-        }
-        
-        // Track already existing Remote Participants
-        for (final p in room.remoteParticipants.values) {
-          _trackParticipantJoin(p);
-        }
-
-        _attachRoomListener(room);
-        _setupRoomListener(room);
-        
-        if (_hasTimer) {
-          _startTimer();
-        }
-
-        // A host may have requested an end while we were still connecting.
-        _consumeEndRequest();
-      }
-    } catch (e) {
       if (!mounted) return;
-      final errorStr = e.toString().toLowerCase();
-      final isPermission = errorStr.contains('notallowederror') || 
-                           errorStr.contains('permission') || 
-                           errorStr.contains('denied');
-                           
-      if (isPermission) {
-        ref.read(meetCallStateProvider.notifier).state = MeetCallState.permissionsDenied;
-      } else if (retries > 0) {
-        // Fallback: Retry connection
-        await Future.delayed(const Duration(seconds: 2));
-        if (mounted) {
-          _initCall(retries: retries - 1);
-        }
-      } else {
-        ref.read(meetCallStateProvider.notifier).state = MeetCallState.error;
-        widget.onError?.call(e);
+
+      final room = ref.read(meetLiveKitRoomProvider);
+      callState.state = MeetCallState.connected;
+
+      // Analytics tracking
+      if (room.localParticipant != null) {
+        _trackParticipantJoin(room.localParticipant!);
       }
+      for (final p in room.remoteParticipants.values) {
+        _trackParticipantJoin(p);
+      }
+
+      // Media is started after the room is up, not inside the connect path, so
+      // a denied camera can no longer take the whole call down with it.
+      final media = await _roomNotifier.enableInitialMedia(
+        camera: widget.startWithCamera,
+        microphone: widget.startWithMicrophone,
+      );
+
+      if (!mounted) return;
+
+      // Reflect what actually happened rather than what was requested.
+      ref.read(meetIsMicEnabledProvider.notifier).state =
+          media.microphoneEnabled;
+      ref.read(meetIsCameraEnabledProvider.notifier).state =
+          media.cameraEnabled;
+
+      if (media.cameraFailure != null) {
+        debugLog('meet_livekit: joined without video — ${media.cameraFailure}');
+      }
+
+      _attachRoomListener(room);
+      _setupRoomListener(room);
+
+      if (_hasTimer) {
+        _startTimer();
+      }
+
+      // A host may have requested an end while we were still connecting.
+      _consumeEndRequest();
+    } on MeetFailure catch (failure) {
+      if (!mounted) return;
+      _handleFailure(failure);
+    } catch (error) {
+      if (!mounted) return;
+      _handleFailure(MeetFailure.from(error));
     }
+  }
+
+  /// Routes a classified failure to a terminal state.
+  ///
+  /// The previous implementation collapsed every failure into a substring test
+  /// for 'permission'/'denied', which made an expired token, an ICE timeout and
+  /// a denied camera indistinguishable in production logs — and therefore
+  /// impossible to diagnose from the field.
+  void _handleFailure(MeetFailure failure) {
+    if (failure.kind == MeetFailureKind.cancelled) return;
+
+    debugLog(
+      'meet_livekit: connect failed [${failure.kind.name}] ${failure.message}',
+    );
+
+    final callState = ref.read(meetCallStateProvider.notifier);
+    callState.state = failure.kind == MeetFailureKind.media
+        ? MeetCallState.permissionsDenied
+        : MeetCallState.error;
+
+    widget.onError?.call(failure);
   }
 
   void _attachRoomListener(Room room) {
@@ -165,7 +281,9 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
 
   void _trackParticipantJoin(Participant p) {
     if (_participantsTracker.containsKey(p.identity)) {
-      _participantsTracker[p.identity]!.markRejoined(DateTime.now()); // Rejoined
+      _participantsTracker[p.identity]!.markRejoined(
+        DateTime.now(),
+      ); // Rejoined
     } else {
       _participantsTracker[p.identity] = ParticipantRecord(
         identity: p.identity,
@@ -188,7 +306,7 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
         timer.cancel();
         return;
       }
-      
+
       if (_secondsRemainingNotifier.value > 0) {
         _secondsRemainingNotifier.value--;
       } else {
@@ -239,10 +357,10 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
         _isManuallyEnding = true;
       });
     }
-    
+
     await Future.delayed(const Duration(milliseconds: 50));
     await _roomNotifier.disconnect();
-    
+
     // Finalize tracking
     final now = DateTime.now();
     for (final record in _participantsTracker.values) {
@@ -250,18 +368,18 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
         record.markLeft(now);
       }
     }
-    
+
     final summary = MeetingSummary(
       startTime: _meetingStartTime,
       endTime: now,
       participants: _participantsTracker,
     );
-    
+
     if (!mounted) {
       widget.onLeaveCall(summary);
       return;
     }
-    
+
     ref.read(meetCallStateProvider.notifier).state = MeetCallState.disconnected;
 
     widget.onLeaveCall(summary);
@@ -276,7 +394,8 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
 
   Future<void> _switchCamera() async {
     final room = ref.read(meetLiveKitRoomProvider);
-    final track = room.localParticipant?.videoTrackPublications.firstOrNull?.track;
+    final track =
+        room.localParticipant?.videoTrackPublications.firstOrNull?.track;
     if (track is LocalVideoTrack) {
       await Helper.switchCamera(track.mediaStreamTrack);
     }
@@ -319,23 +438,30 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
   void _onRoomEvent() {
     if (mounted) {
       setState(() {});
-      
+
       final room = ref.read(meetLiveKitRoomProvider);
       final callStateNotifier = ref.read(meetCallStateProvider.notifier);
-      
+
       if (room.connectionState == ConnectionState.reconnecting) {
         callStateNotifier.state = MeetCallState.connecting;
       } else if (room.connectionState == ConnectionState.connected) {
         callStateNotifier.state = MeetCallState.connected;
-      } else if (room.connectionState == ConnectionState.disconnected && !_isManuallyEnding) {
+      } else if (room.connectionState == ConnectionState.disconnected &&
+          !_isManuallyEnding) {
         // A host-requested end means the disconnect is intentional, so never
         // resurrect the call. This check is what stops an externally-driven
         // disconnect (e.g. a host-side timer expiring) from re-joining the room.
         if (ref.read(meetEndCallRequestedProvider)) return;
 
-        // Automatically attempt to reconnect instead of dropping the call!
+        // A connect that already gave up terminally must not be restarted by a
+        // room event. Otherwise the failure re-enters the connect path and the
+        // whole cycle begins again, which is how a dead call used to spin.
+        if (_roomNotifier.hasGaveUp) return;
+
+        // Reconnect on a genuine network drop. Safe to call without awaiting:
+        // the notifier coalesces onto the single in-flight attempt.
         callStateNotifier.state = MeetCallState.connecting;
-        _initCall(); // Safely recreates room and reconnects
+        _initCall();
       }
     }
   }
@@ -350,15 +476,45 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
     _detachRoomListener();
     _roomNotifier.disconnect();
     // Never leave an end-request latched. The provider is global, so a stale
-    // `true` would immediately terminate the next call that mounts.
-    ref.read(meetEndCallRequestedProvider.notifier).clear();
+    // `true` would immediately terminate the next call that mounts. Uses the
+    // notifier captured in initState rather than `ref`, which is unusable here.
+    _endCallRequester.clear();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.detached) {
-      _roomNotifier.disconnect();
+    switch (state) {
+      case AppLifecycleState.resumed:
+        // The OS suspends the WebRTC engine whenever the app is backgrounded,
+        // even briefly — an incoming call, a notification, a quick app switch.
+        // On resume the engine is often already dead while the UI still claims
+        // the call is up, so re-assert the connection instead of waiting for
+        // the SFU to eventually time the participant out.
+        if (_isManuallyEnding) return;
+        if (ref.read(meetEndCallRequestedProvider)) return;
+        if (_roomNotifier.hasGaveUp) return;
+
+        final room = ref.read(meetLiveKitRoomProvider);
+        if (room.connectionState == ConnectionState.disconnected) {
+          debugLog(
+            'meet_livekit: resumed with a dead connection, reconnecting',
+          );
+          _initCall();
+        }
+
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+        // Nothing to do. Disconnecting here would kill the call on every app
+        // switch, which is precisely the behaviour this previously had.
+        break;
+
+      case AppLifecycleState.detached:
+        // The view is genuinely gone. Release the hardware and the engine so no
+        // ghost audio survives, but leave the exit path to `_forceEndCall`.
+        _roomNotifier.disconnect();
+        break;
     }
   }
 
@@ -381,26 +537,32 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
     }
 
     final screenWidth = MediaQuery.sizeOf(context).width;
-    final isMobile    = screenWidth < 600;
-    final callState   = ref.watch(meetCallStateProvider);
-    final isCameraOn  = ref.watch(meetIsCameraEnabledProvider);
-    final isMicOn     = ref.watch(meetIsMicEnabledProvider);
-    final isScreenOn  = ref.watch(meetIsScreenShareEnabledProvider);
-    final isTileView  = ref.watch(meetIsTileViewEnabledProvider);
-    final isChatOpen  = ref.watch(meetIsChatOpenProvider);
-    final room        = ref.watch(meetLiveKitRoomProvider);
+    final isMobile = screenWidth < 600;
+    final callState = ref.watch(meetCallStateProvider);
+    final isCameraOn = ref.watch(meetIsCameraEnabledProvider);
+    final isMicOn = ref.watch(meetIsMicEnabledProvider);
+    final isScreenOn = ref.watch(meetIsScreenShareEnabledProvider);
+    final isTileView = ref.watch(meetIsTileViewEnabledProvider);
+    final isChatOpen = ref.watch(meetIsChatOpenProvider);
+    final room = ref.watch(meetLiveKitRoomProvider);
 
     Widget body = switch (callState) {
       MeetCallState.connecting => const _ConnectingView(),
-      MeetCallState.permissionsDenied => _PermissionsDeniedView(onRetry: () => _initCall(), onBack: () => _forceEndCall()),
-      MeetCallState.error => _ErrorView(onRetry: () => _initCall(), onBack: () => _forceEndCall()),
+      MeetCallState.permissionsDenied => _PermissionsDeniedView(
+        onRetry: () => _initCall(isUserInitiated: true),
+        onBack: () => _forceEndCall(),
+      ),
+      MeetCallState.error => _ErrorView(
+        onRetry: () => _initCall(isUserInitiated: true),
+        onBack: () => _forceEndCall(),
+      ),
       MeetCallState.connected || _ => _CallView(
-        room:        room,
-        isCameraOn:  isCameraOn,
-        isMicOn:     isMicOn,
-        isScreenOn:  isScreenOn,
-        isTileView:  isTileView,
-        onEndCall:   _endCall,
+        room: room,
+        isCameraOn: isCameraOn,
+        isMicOn: isMicOn,
+        isScreenOn: isScreenOn,
+        isTileView: isTileView,
+        onEndCall: _endCall,
         onToggleCam: _toggleCamera,
         onToggleMic: _toggleMic,
         onSwitchCamera: _switchCamera,
@@ -422,27 +584,35 @@ class _MeetRoomScreenState extends ConsumerState<MeetRoomScreen> with WidgetsBin
         backgroundColor: Colors.black,
         body: Stack(
           children: [
-            Positioned.fill(
-              child: body,
-            ),
+            Positioned.fill(child: body),
             AnimatedPositioned(
               duration: const Duration(milliseconds: 300),
               curve: Curves.easeOutCubic,
-              top: isMobile ? (isChatOpen ? MediaQuery.sizeOf(context).height / 2 : MediaQuery.sizeOf(context).height) : 0,
+              top: isMobile
+                  ? (isChatOpen
+                        ? MediaQuery.sizeOf(context).height / 2
+                        : MediaQuery.sizeOf(context).height)
+                  : 0,
               bottom: isMobile ? 0 : 0,
               right: isMobile ? 0 : (isChatOpen ? 0 : -350),
               left: isMobile ? 0 : null,
               width: isMobile ? null : 350,
               child: ClipRRect(
-                borderRadius: isMobile ? const BorderRadius.vertical(top: Radius.circular(24)) : BorderRadius.zero,
+                borderRadius: isMobile
+                    ? const BorderRadius.vertical(top: Radius.circular(24))
+                    : BorderRadius.zero,
                 child: BackdropFilter(
                   filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
                   child: Container(
                     decoration: BoxDecoration(
                       color: Colors.black.withValues(alpha: 0.5),
                       border: Border(
-                        left: isMobile ? BorderSide.none : const BorderSide(color: Colors.white12),
-                        top: isMobile ? const BorderSide(color: Colors.white12) : BorderSide.none,
+                        left: isMobile
+                            ? BorderSide.none
+                            : const BorderSide(color: Colors.white12),
+                        top: isMobile
+                            ? const BorderSide(color: Colors.white12)
+                            : BorderSide.none,
                       ),
                     ),
                     child: MeetEphemeralChatWidget(
@@ -491,44 +661,68 @@ class _CallTimerBanner extends StatelessWidget {
         return ValueListenableBuilder<bool>(
           valueListenable: gracePeriodNotifier,
           builder: (context, gracePeriodActive, _) {
-            final String timeStr = '${(secondsRemaining ~/ 60).toString().padLeft(2, '0')}:${(secondsRemaining % 60).toString().padLeft(2, '0')}';
-            final bool isLowTime = secondsRemaining < 60 && secondsRemaining > 0;
+            final String timeStr =
+                '${(secondsRemaining ~/ 60).toString().padLeft(2, '0')}:${(secondsRemaining % 60).toString().padLeft(2, '0')}';
+            final bool isLowTime =
+                secondsRemaining < 60 && secondsRemaining > 0;
 
             if (!gracePeriodActive && !isLowTime && secondsRemaining > 300) {
               return const SizedBox.shrink(); // Only show when under 5 minutes or grace period
             }
 
             return MeetGlassContainer(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              borderRadius: BorderRadius.circular(MeetRadius.full),
-              tintColor: Colors.white.withValues(alpha: 0.1),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.25), width: 1.5),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                decoration: BoxDecoration(
-                  color: gracePeriodActive 
-                    ? Colors.red.withValues(alpha: 0.2)
-                    : isLowTime ? Colors.orange.withValues(alpha: 0.2) : Colors.transparent,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
                   borderRadius: BorderRadius.circular(MeetRadius.full),
+                  tintColor: Colors.white.withValues(alpha: 0.1),
                   border: Border.all(
-                    color: gracePeriodActive 
-                      ? Colors.red.withValues(alpha: 0.5)
-                      : Colors.transparent,
+                    color: Colors.white.withValues(alpha: 0.25),
+                    width: 1.5,
                   ),
-                ),
-                child: Text(
-                  gracePeriodActive ? 'Ending in $secondsRemaining s...' : 'Time remaining: $timeStr',
-                  style: TextStyle(
-                    color: gracePeriodActive ? Colors.red : Colors.white, 
-                    fontWeight: FontWeight.bold, 
-                    fontSize: 14, 
-                    decoration: TextDecoration.none
-                  ),
-                ),
-              ).animate(target: gracePeriodActive ? 1 : 0)
-               .tint(color: Colors.red, end: 0.5)
-               .shimmer(duration: 1.seconds),
-            ).animate().fadeIn(duration: 400.ms).slideY(begin: -0.5, end: 0, curve: Curves.easeOutQuad);
+                  child:
+                      Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: gracePeriodActive
+                                  ? Colors.red.withValues(alpha: 0.2)
+                                  : isLowTime
+                                  ? Colors.orange.withValues(alpha: 0.2)
+                                  : Colors.transparent,
+                              borderRadius: BorderRadius.circular(
+                                MeetRadius.full,
+                              ),
+                              border: Border.all(
+                                color: gracePeriodActive
+                                    ? Colors.red.withValues(alpha: 0.5)
+                                    : Colors.transparent,
+                              ),
+                            ),
+                            child: Text(
+                              gracePeriodActive
+                                  ? 'Ending in $secondsRemaining s...'
+                                  : 'Time remaining: $timeStr',
+                              style: TextStyle(
+                                color: gracePeriodActive
+                                    ? Colors.red
+                                    : Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                                decoration: TextDecoration.none,
+                              ),
+                            ),
+                          )
+                          .animate(target: gracePeriodActive ? 1 : 0)
+                          .tint(color: Colors.red, end: 0.5)
+                          .shimmer(duration: 1.seconds),
+                )
+                .animate()
+                .fadeIn(duration: 400.ms)
+                .slideY(begin: -0.5, end: 0, curve: Curves.easeOutQuad);
           },
         );
       },
@@ -550,7 +744,7 @@ class _ConnectingView extends StatelessWidget {
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
           colors: [
-            MeetColors.surfaceElevated.withValues(alpha: 0.9), 
+            MeetColors.surfaceElevated.withValues(alpha: 0.9),
             Colors.black,
           ],
         ),
@@ -560,23 +754,38 @@ class _ConnectingView extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Container(
-              padding: const EdgeInsets.all(24),
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: MeetColors.primary.withValues(alpha: 0.1),
-                boxShadow: MeetShadows.glow(MeetColors.primary),
-              ),
-              child: const Icon(LucideIcons.video, color: MeetColors.primary, size: 48)
-                  .animate(onPlay: (controller) => controller.repeat(reverse: true))
-                  .scale(begin: const Offset(1, 1), end: const Offset(1.1, 1.1), duration: 1.seconds)
-                  .shimmer(duration: 2.seconds),
-            ).animate().fadeIn(duration: 500.ms).slideY(begin: 0.2, end: 0, curve: Curves.easeOutCubic),
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: MeetColors.primary.withValues(alpha: 0.1),
+                    boxShadow: MeetShadows.glow(MeetColors.primary),
+                  ),
+                  child:
+                      const Icon(
+                            LucideIcons.video,
+                            color: MeetColors.primary,
+                            size: 48,
+                          )
+                          .animate(
+                            onPlay: (controller) =>
+                                controller.repeat(reverse: true),
+                          )
+                          .scale(
+                            begin: const Offset(1, 1),
+                            end: const Offset(1.1, 1.1),
+                            duration: 1.seconds,
+                          )
+                          .shimmer(duration: 2.seconds),
+                )
+                .animate()
+                .fadeIn(duration: 500.ms)
+                .slideY(begin: 0.2, end: 0, curve: Curves.easeOutCubic),
             const SizedBox(height: 32),
             const Text(
               'Connecting securely...',
               style: TextStyle(
-                color: Colors.white, 
-                fontSize: 18, 
+                color: Colors.white,
+                fontSize: 18,
                 fontWeight: FontWeight.w600,
                 letterSpacing: 0.5,
               ),
@@ -604,27 +813,43 @@ class _PermissionsDeniedView extends StatelessWidget {
         children: [
           const Icon(LucideIcons.micOff, color: Colors.orange, size: 64),
           const SizedBox(height: 16),
-          const Text('Permissions Required', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+          const Text(
+            'Permissions Required',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
           const SizedBox(height: 8),
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 32.0),
-            child: Text('We need access to your camera and microphone to connect you to the room.', 
-              style: TextStyle(color: Colors.white70, fontSize: 14), textAlign: TextAlign.center),
+            child: Text(
+              'We need access to your camera and microphone to connect you to the room.',
+              style: TextStyle(color: Colors.white70, fontSize: 14),
+              textAlign: TextAlign.center,
+            ),
           ),
           const SizedBox(height: 24),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              TextButton(onPressed: onBack,  child: const Text('Go Back')),
+              TextButton(onPressed: onBack, child: const Text('Go Back')),
               const SizedBox(width: 16),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: MeetColors.primary, 
+                  backgroundColor: MeetColors.primary,
                   foregroundColor: Colors.black,
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 12,
+                  ),
                 ),
-                onPressed: onRetry, 
-                child: const Text('Relaunch Permissions', style: TextStyle(fontWeight: FontWeight.bold))
+                onPressed: onRetry,
+                child: const Text(
+                  'Relaunch Permissions',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
               ),
             ],
           ),
@@ -647,12 +872,15 @@ class _ErrorView extends StatelessWidget {
         children: [
           const Icon(Icons.video_call_outlined, color: Colors.red, size: 64),
           const SizedBox(height: 16),
-          const Text('Could not connect', style: TextStyle(color: Colors.white, fontSize: 18)),
+          const Text(
+            'Could not connect',
+            style: TextStyle(color: Colors.white, fontSize: 18),
+          ),
           const SizedBox(height: 24),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              TextButton(onPressed: onBack,  child: const Text('Go Back')),
+              TextButton(onPressed: onBack, child: const Text('Go Back')),
               const SizedBox(width: 16),
               ElevatedButton(onPressed: onRetry, child: const Text('Retry')),
             ],
@@ -705,33 +933,46 @@ class _CallView extends StatelessWidget {
     final remoteParticipants = room.remoteParticipants.values.toList();
     final List<Participant> allParticipants = [
       ?localParticipant,
-      ...remoteParticipants
+      ...remoteParticipants,
     ];
 
-    final activeScreenShareRemote = remoteParticipants.where(
-      (p) => p.videoTrackPublications.any((t) => t.source == TrackSource.screenShareVideo && t.subscribed)
-    ).firstOrNull;
+    final activeScreenShareRemote = remoteParticipants
+        .where(
+          (p) => p.videoTrackPublications.any(
+            (t) => t.source == TrackSource.screenShareVideo && t.subscribed,
+          ),
+        )
+        .firstOrNull;
 
-    final activeScreenShareLocal = (localParticipant != null && isScreenOn) ? localParticipant : null;
-    final bool isScreenShareActive = activeScreenShareRemote != null || activeScreenShareLocal != null;
+    final activeScreenShareLocal = (localParticipant != null && isScreenOn)
+        ? localParticipant
+        : null;
+    final bool isScreenShareActive =
+        activeScreenShareRemote != null || activeScreenShareLocal != null;
 
     Widget mainBackground;
     bool showPips = true;
 
     if (activeScreenShareRemote != null) {
       mainBackground = _RemoteParticipantView(
-          participant: activeScreenShareRemote, source: TrackSource.screenShareVideo);
+        participant: activeScreenShareRemote,
+        source: TrackSource.screenShareVideo,
+      );
     } else if (activeScreenShareLocal != null) {
       mainBackground = _LocalParticipantView(
-          participant: localParticipant,
-          isCameraOn: true,
-          source: TrackSource.screenShareVideo);
+        participant: localParticipant,
+        isCameraOn: true,
+        source: TrackSource.screenShareVideo,
+      );
     } else if (isTileView) {
       showPips = false;
       if (allParticipants.isEmpty) {
         mainBackground = const Center(
-            child: Text('Waiting for participants...',
-                style: TextStyle(color: Colors.white54, fontSize: 16)));
+          child: Text(
+            'Waiting for participants...',
+            style: TextStyle(color: Colors.white54, fontSize: 16),
+          ),
+        );
       } else {
         mainBackground = LayoutBuilder(
           builder: (context, constraints) {
@@ -777,9 +1018,12 @@ class _CallView extends StatelessWidget {
                     ),
                     child: p is LocalParticipant
                         ? _LocalParticipantView(
-                            participant: p, isCameraOn: isCameraOn)
+                            participant: p,
+                            isCameraOn: isCameraOn,
+                          )
                         : _RemoteParticipantView(
-                            participant: p as RemoteParticipant),
+                            participant: p as RemoteParticipant,
+                          ),
                   );
                 }).toList(),
               ),
@@ -788,7 +1032,9 @@ class _CallView extends StatelessWidget {
         );
       }
     } else if (remoteParticipants.isNotEmpty) {
-      mainBackground = _RemoteParticipantView(participant: remoteParticipants.first);
+      mainBackground = _RemoteParticipantView(
+        participant: remoteParticipants.first,
+      );
     } else {
       mainBackground = Container(
         color: const Color(0xFF0A0A1A),
@@ -813,7 +1059,9 @@ class _CallView extends StatelessWidget {
       if (isScreenShareActive) {
         pipParticipants = allParticipants;
       } else if (!isTileView && remoteParticipants.isNotEmpty) {
-        pipParticipants = allParticipants.where((p) => p != remoteParticipants.first).toList();
+        pipParticipants = allParticipants
+            .where((p) => p != remoteParticipants.first)
+            .toList();
       } else {
         pipParticipants = allParticipants;
       }
@@ -848,7 +1096,7 @@ class _CallView extends StatelessWidget {
           Positioned(
             top: 48,
             right: 16,
-            bottom: 120, 
+            bottom: 120,
             child: SizedBox(
               width: 120,
               child: SingleChildScrollView(
@@ -857,27 +1105,45 @@ class _CallView extends StatelessWidget {
                   children: pipParticipants.map((p) {
                     return Padding(
                       padding: const EdgeInsets.only(bottom: 8),
-                      child: Container(
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: Colors.white.withValues(alpha: 0.2), width: 1.5),
-                          boxShadow: const [
-                            BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 4)),
-                          ],
-                        ),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(10.5),
-                          child: SizedBox(
-                            width: 120,
-                            height: 160,
-                            child: p is LocalParticipant
-                                ? _LocalParticipantView(
-                                    participant: p, isCameraOn: isCameraOn)
-                                : _RemoteParticipantView(
-                                    participant: p as RemoteParticipant),
-                          ),
-                        ),
-                      ).animate().fadeIn(duration: 400.ms).slideX(begin: 0.2, end: 0, curve: Curves.easeOutQuad),
+                      child:
+                          Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                    color: Colors.white.withValues(alpha: 0.2),
+                                    width: 1.5,
+                                  ),
+                                  boxShadow: const [
+                                    BoxShadow(
+                                      color: Colors.black26,
+                                      blurRadius: 8,
+                                      offset: Offset(0, 4),
+                                    ),
+                                  ],
+                                ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(10.5),
+                                  child: SizedBox(
+                                    width: 120,
+                                    height: 160,
+                                    child: p is LocalParticipant
+                                        ? _LocalParticipantView(
+                                            participant: p,
+                                            isCameraOn: isCameraOn,
+                                          )
+                                        : _RemoteParticipantView(
+                                            participant: p as RemoteParticipant,
+                                          ),
+                                  ),
+                                ),
+                              )
+                              .animate()
+                              .fadeIn(duration: 400.ms)
+                              .slideX(
+                                begin: 0.2,
+                                end: 0,
+                                curve: Curves.easeOutQuad,
+                              ),
                     );
                   }).toList(),
                 ),
@@ -887,7 +1153,7 @@ class _CallView extends StatelessWidget {
         Positioned(
           bottom: isMobile ? MediaQuery.of(context).padding.bottom + 8 : 24,
           left: 0,
-          right: (isChatOpen && !isMobile) ? 350 : 0, 
+          right: (isChatOpen && !isMobile) ? 350 : 0,
           child: Center(
             child: MeetGlassContainer(
               padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
@@ -923,7 +1189,10 @@ class _CallView extends StatelessWidget {
 class _RemoteParticipantView extends StatefulWidget {
   final RemoteParticipant participant;
   final TrackSource source;
-  const _RemoteParticipantView({required this.participant, this.source = TrackSource.camera});
+  const _RemoteParticipantView({
+    required this.participant,
+    this.source = TrackSource.camera,
+  });
 
   @override
   State<_RemoteParticipantView> createState() => _RemoteParticipantViewState();
@@ -945,15 +1214,22 @@ class _RemoteParticipantViewState extends State<_RemoteParticipantView> {
 
   void _updateVideoTrack() {
     _videoTrack = widget.participant.videoTrackPublications
-      .where((pub) {
-        if (!pub.subscribed || pub.track == null || pub.source != widget.source) return false;
-        if (pub.muted || (pub.track?.muted ?? false)) return false;
-        return true;
-      })
-      .map((pub) => pub.track as VideoTrack)
-      .firstOrNull;
-      
-    if (widget.source == TrackSource.camera && !widget.participant.isCameraEnabled()) {
+        .where((pub) {
+          if (!pub.subscribed ||
+              pub.track == null ||
+              pub.source != widget.source) {
+            return false;
+          }
+          if (pub.muted || (pub.track?.muted ?? false)) {
+            return false;
+          }
+          return true;
+        })
+        .map((pub) => pub.track as VideoTrack)
+        .firstOrNull;
+
+    if (widget.source == TrackSource.camera &&
+        !widget.participant.isCameraEnabled()) {
       _videoTrack = null;
     }
   }
@@ -981,7 +1257,7 @@ class _RemoteParticipantViewState extends State<_RemoteParticipantView> {
         ),
       );
     }
-    
+
     return Stack(
       fit: StackFit.expand,
       children: [
@@ -993,13 +1269,17 @@ class _RemoteParticipantViewState extends State<_RemoteParticipantView> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LOCAL PARTICIPANT VIDEO 
+// LOCAL PARTICIPANT VIDEO
 // ─────────────────────────────────────────────────────────────────────────────
 class _LocalParticipantView extends StatefulWidget {
   final LocalParticipant? participant;
   final bool isCameraOn;
   final TrackSource source;
-  const _LocalParticipantView({required this.participant, required this.isCameraOn, this.source = TrackSource.camera});
+  const _LocalParticipantView({
+    required this.participant,
+    required this.isCameraOn,
+    this.source = TrackSource.camera,
+  });
 
   @override
   State<_LocalParticipantView> createState() => _LocalParticipantViewState();
@@ -1021,9 +1301,9 @@ class _LocalParticipantViewState extends State<_LocalParticipantView> {
 
   void _updateVideoTrack() {
     _videoTrack = widget.participant?.videoTrackPublications
-      .where((pub) => pub.track != null && pub.source == widget.source)
-      .map((pub) => pub.track as VideoTrack)
-      .firstOrNull;
+        .where((pub) => pub.track != null && pub.source == widget.source)
+        .map((pub) => pub.track as VideoTrack)
+        .firstOrNull;
   }
 
   @override
@@ -1049,23 +1329,25 @@ class _LocalParticipantViewState extends State<_LocalParticipantView> {
         ),
       );
     }
-    
+
     return Stack(
       fit: StackFit.expand,
       children: [
         content,
         if (widget.participant != null)
-           _buildConnectionOverlay(widget.participant!.connectionQuality),
+          _buildConnectionOverlay(widget.participant!.connectionQuality),
       ],
     );
   }
 }
 
 Widget _buildConnectionOverlay(ConnectionQuality quality) {
-  if (quality == ConnectionQuality.excellent || quality == ConnectionQuality.good || quality == ConnectionQuality.unknown) {
+  if (quality == ConnectionQuality.excellent ||
+      quality == ConnectionQuality.good ||
+      quality == ConnectionQuality.unknown) {
     return const SizedBox.shrink();
   }
-  
+
   final isLost = quality == ConnectionQuality.lost;
   return Positioned(
     top: 8,
@@ -1081,14 +1363,19 @@ Widget _buildConnectionOverlay(ConnectionQuality quality) {
         mainAxisSize: MainAxisSize.min,
         children: [
           Icon(
-            isLost ? LucideIcons.wifiOff : LucideIcons.wifi, 
-            color: isLost ? Colors.red : Colors.orange, 
-            size: 14
+            isLost ? LucideIcons.wifiOff : LucideIcons.wifi,
+            color: isLost ? Colors.red : Colors.orange,
+            size: 14,
           ),
           const SizedBox(width: 4),
           Text(
             isLost ? 'Lost' : 'Poor Connection',
-            style: TextStyle(color: isLost ? Colors.red : Colors.orange, fontSize: 10, fontWeight: FontWeight.bold, decoration: TextDecoration.none),
+            style: TextStyle(
+              color: isLost ? Colors.red : Colors.orange,
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+              decoration: TextDecoration.none,
+            ),
           ),
         ],
       ),
@@ -1137,61 +1424,73 @@ class _ControlBar extends StatelessWidget {
       runSpacing: 16,
       alignment: WrapAlignment.center,
       crossAxisAlignment: WrapCrossAlignment.center,
-        children: [
-          _ControlButton(
-            icon: isMicOn ? Icons.mic : Icons.mic_off,
-            label: isMicOn ? 'Mute' : 'Unmute',
-            onTap: onToggleMic,
-            isActive: isMicOn,
-            isMobile: isMobile,
-          ),
-          MeetBouncyTap(
-            onTap: onEndCall,
-            child: Container(
-              width: isMobile ? 48 : 56,
-              height: isMobile ? 48 : 56,
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFFE53935), Color(0xFFC62828)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
+      children:
+          [
+                _ControlButton(
+                  icon: isMicOn ? Icons.mic : Icons.mic_off,
+                  label: isMicOn ? 'Mute' : 'Unmute',
+                  onTap: onToggleMic,
+                  isActive: isMicOn,
+                  isMobile: isMobile,
                 ),
-                shape: BoxShape.circle,
-                boxShadow: MeetShadows.glow(const Color(0xFFE53935)),
-              ),
-              child: Icon(Icons.call_end, color: Colors.white, size: isMobile ? 22 : 26),
-            ),
-          ),
-          _ControlButton(
-            icon: isCameraOn ? Icons.videocam : Icons.videocam_off,
-            label: isCameraOn ? 'Hide Cam' : 'Show Cam',
-            onTap: onToggleCam,
-            isActive: isCameraOn,
-            isMobile: isMobile,
-          ),
-          _ControlButton(
-            icon: isScreenOn ? Icons.stop_screen_share : Icons.screen_share,
-            label: isScreenOn ? 'Stop Share' : 'Share',
-            onTap: onToggleScreen,
-            isActive: isScreenOn,
-            isMobile: isMobile,
-          ),
-          _ControlButton(
-            icon: isTileView ? Icons.grid_view : Icons.picture_in_picture,
-            label: isTileView ? 'Speaker' : 'Grid',
-            onTap: onToggleTileView,
-            isActive: isTileView,
-            isMobile: isMobile,
-          ),
-          _ControlButton(
-            icon: isChatOpen ? Icons.chat_bubble : Icons.chat_bubble_outline,
-            label: 'Chat',
-            onTap: onToggleChat,
-            isActive: isChatOpen,
-            isMobile: isMobile,
-          ),
-        ].animate(interval: 50.ms).fadeIn(duration: 300.ms).slideY(begin: 0.2, end: 0, curve: Curves.easeOutQuad),
-      );
+                MeetBouncyTap(
+                  onTap: onEndCall,
+                  child: Container(
+                    width: isMobile ? 48 : 56,
+                    height: isMobile ? 48 : 56,
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFFE53935), Color(0xFFC62828)],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      shape: BoxShape.circle,
+                      boxShadow: MeetShadows.glow(const Color(0xFFE53935)),
+                    ),
+                    child: Icon(
+                      Icons.call_end,
+                      color: Colors.white,
+                      size: isMobile ? 22 : 26,
+                    ),
+                  ),
+                ),
+                _ControlButton(
+                  icon: isCameraOn ? Icons.videocam : Icons.videocam_off,
+                  label: isCameraOn ? 'Hide Cam' : 'Show Cam',
+                  onTap: onToggleCam,
+                  isActive: isCameraOn,
+                  isMobile: isMobile,
+                ),
+                _ControlButton(
+                  icon: isScreenOn
+                      ? Icons.stop_screen_share
+                      : Icons.screen_share,
+                  label: isScreenOn ? 'Stop Share' : 'Share',
+                  onTap: onToggleScreen,
+                  isActive: isScreenOn,
+                  isMobile: isMobile,
+                ),
+                _ControlButton(
+                  icon: isTileView ? Icons.grid_view : Icons.picture_in_picture,
+                  label: isTileView ? 'Speaker' : 'Grid',
+                  onTap: onToggleTileView,
+                  isActive: isTileView,
+                  isMobile: isMobile,
+                ),
+                _ControlButton(
+                  icon: isChatOpen
+                      ? Icons.chat_bubble
+                      : Icons.chat_bubble_outline,
+                  label: 'Chat',
+                  onTap: onToggleChat,
+                  isActive: isChatOpen,
+                  isMobile: isMobile,
+                ),
+              ]
+              .animate(interval: 50.ms)
+              .fadeIn(duration: 300.ms)
+              .slideY(begin: 0.2, end: 0, curve: Curves.easeOutQuad),
+    );
   }
 }
 
@@ -1222,8 +1521,8 @@ class _ControlButton extends StatelessWidget {
             height: isMobile ? 44 : 52,
             decoration: BoxDecoration(
               color: isActive
-                ? Colors.white.withValues(alpha: 0.15)
-                : Colors.white.withValues(alpha: 0.05),
+                  ? Colors.white.withValues(alpha: 0.15)
+                  : Colors.white.withValues(alpha: 0.05),
               shape: BoxShape.circle,
               border: Border.all(
                 color: Colors.white.withValues(alpha: isActive ? 0.3 : 0.1),
@@ -1232,7 +1531,10 @@ class _ControlButton extends StatelessWidget {
             child: Icon(icon, color: Colors.white, size: isMobile ? 18 : 22),
           ),
           const SizedBox(height: 6),
-          Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+          Text(
+            label,
+            style: const TextStyle(color: Colors.white54, fontSize: 11),
+          ),
         ],
       ),
     );
